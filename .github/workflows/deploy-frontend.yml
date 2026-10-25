@@ -1,0 +1,88 @@
+# Manually republishes the existing static frontend to the S3 bucket and
+# invalidates CloudFront. This workflow does not build the API container or
+# apply Terraform; the shared bucket and production CloudFront distribution
+# must already exist. It runs only from main and uses the protected production
+# environment and the same concurrency group as infrastructure deployments.
+name: Deploy frontend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Publish frontend to S3 and CloudFront
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      PRODUCTION_STATE_KEY: hello-saas/production/terraform.tfstate
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.4
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Read frontend bucket and CloudFront distribution from Terraform state
+        id: resources
+        run: |
+          terraform -chdir=terraform/production init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${PRODUCTION_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+          outputs="$(terraform -chdir=terraform/production output -json)"
+          bucket="$(printf '%s' "$outputs" | jq -r '.frontend_bucket_name.value // empty')"
+          distribution_id="$(printf '%s' "$outputs" | jq -r '.cloudfront_distribution_id.value // empty')"
+
+          if [ -z "$bucket" ] || [ -z "$distribution_id" ]; then
+            echo "::error::Frontend deployment requires the shared S3 bucket and an enabled CloudFront distribution. Apply shared and production Terraform first, with a domain and hosted zone configured."
+            exit 1
+          fi
+
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "distribution_id=$distribution_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload static frontend
+        env:
+          FRONTEND_BUCKET: ${{ steps.resources.outputs.bucket }}
+        run: |
+          aws s3 sync frontend/ "s3://${FRONTEND_BUCKET}" \
+            --delete \
+            --cache-control "public,max-age=300"
+          aws s3 cp frontend/index.html "s3://${FRONTEND_BUCKET}/index.html" \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --content-type "text/html; charset=utf-8"
+
+      - name: Invalidate CloudFront cache
+        env:
+          DISTRIBUTION_ID: ${{ steps.resources.outputs.distribution_id }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
