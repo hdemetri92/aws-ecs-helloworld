@@ -1,0 +1,532 @@
+# Deploys changes from main using path filters so unrelated infrastructure and
+# application components are not rebuilt or applied.
+# Shared Terraform is applied before production when shared files change;
+# production changes and application image releases use a reviewed plan and
+# the protected production environment. Infrastructure-only changes reuse the
+# image already running in ECS, and frontend-only changes publish to S3 and
+# invalidate CloudFront without applying Terraform. State bootstrap is
+# validated but never automatically applied. Manual dispatch runs the full
+# deployment path.
+name: Plan and deploy infrastructure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  SHARED_STATE_KEY: hello-saas/shared/terraform.tfstate
+  PRODUCTION_STATE_KEY: hello-saas/production/terraform.tfstate
+  TF_VERSION: 1.13.4
+
+jobs:
+  changes:
+    name: Detect changed deployment areas
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      production: ${{ steps.filter.outputs.production }}
+      app: ${{ steps.filter.outputs.app }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      state_bootstrap: ${{ steps.filter.outputs.state_bootstrap }}
+    steps:
+      - name: Check out source
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'push'
+        uses: dorny/paths-filter@v3
+        with:
+          base: ${{ github.event.before }}
+          filters: |
+            shared:
+              - 'terraform/shared/**'
+              - '!terraform/shared/state-bootstrap/**'
+            production:
+              - 'terraform/production/**'
+              - 'terraform/modules/**'
+            app:
+              - 'python_service/**'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'requirements.txt'
+            frontend:
+              - 'frontend/**'
+            state_bootstrap:
+              - 'terraform/shared/state-bootstrap/**'
+
+  quality-gate:
+    name: Test and validate changed areas
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: needs.changes.outputs.app == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run application tests
+        if: needs.changes.outputs.app == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pytest -q
+
+      - name: Build the application container
+        if: needs.changes.outputs.app == 'true' || github.event_name == 'workflow_dispatch'
+        run: docker build --platform linux/amd64 --tag hello-saas:ci .
+
+      - name: Set up Terraform
+        if: >-
+          needs.changes.outputs.shared == 'true' ||
+          needs.changes.outputs.production == 'true' ||
+          needs.changes.outputs.state_bootstrap == 'true' ||
+          github.event_name == 'workflow_dispatch'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check Terraform formatting
+        if: >-
+          needs.changes.outputs.shared == 'true' ||
+          needs.changes.outputs.production == 'true' ||
+          needs.changes.outputs.state_bootstrap == 'true' ||
+          github.event_name == 'workflow_dispatch'
+        run: terraform fmt -check -recursive
+
+      - name: Validate shared root
+        if: needs.changes.outputs.shared == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          terraform -chdir=terraform/shared init -backend=false -input=false
+          terraform -chdir=terraform/shared validate
+
+      - name: Validate production root
+        if: >-
+          needs.changes.outputs.production == 'true' ||
+          needs.changes.outputs.shared == 'true' ||
+          github.event_name == 'workflow_dispatch'
+        run: |
+          terraform -chdir=terraform/production init -backend=false -input=false
+          terraform -chdir=terraform/production validate
+
+      - name: Validate state bootstrap root
+        if: needs.changes.outputs.state_bootstrap == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          terraform -chdir=terraform/shared/state-bootstrap init -backend=false -input=false
+          terraform -chdir=terraform/shared/state-bootstrap validate
+
+  shared-plan:
+    name: Plan shared infrastructure
+    needs: [changes, quality-gate]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (needs.changes.outputs.shared == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_domain_name: ${{ vars.DOMAIN_NAME || '' }}
+      TF_VAR_route53_zone_id: ${{ vars.ROUTE53_ZONE_ID || '' }}
+      TF_VAR_create_route53_zone: ${{ vars.CREATE_ROUTE53_ZONE || 'false' }}
+      TF_VAR_github_repository: ${{ github.repository }}
+      TF_VAR_github_oidc_provider_arn: ${{ vars.GITHUB_OIDC_PROVIDER_ARN || '' }}
+      TF_VAR_terraform_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize shared state
+        run: |
+          terraform -chdir=terraform/shared init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${SHARED_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Create and render shared plan
+        run: |
+          terraform -chdir=terraform/shared plan -input=false -out=shared.tfplan
+          terraform -chdir=terraform/shared show -no-color shared.tfplan > shared-plan.txt
+
+      - name: Upload shared plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-plan-${{ github.run_id }}
+          path: |
+            terraform/shared/shared.tfplan
+            shared-plan.txt
+          retention-days: 1
+
+  shared-apply:
+    name: Apply reviewed shared plan
+    needs: shared-plan
+    if: github.ref == 'refs/heads/main' && needs.shared-plan.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize shared state
+        run: |
+          terraform -chdir=terraform/shared init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${SHARED_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Download shared plan
+        uses: actions/download-artifact@v4
+        with:
+          name: shared-plan-${{ github.run_id }}
+          path: .
+
+      - name: Apply exact shared plan
+        run: terraform -chdir=terraform/shared apply -input=false -auto-approve shared.tfplan
+
+  production-plan:
+    name: Build image and plan production
+    needs: [changes, quality-gate, shared-apply]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.quality-gate.result == 'success' &&
+      (needs.changes.outputs.production == 'true' ||
+       needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.app == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (needs.shared-apply.result == 'success' || needs.shared-apply.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_terraform_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_enable_database: ${{ vars.ENABLE_DATABASE || 'false' }}
+      TF_VAR_database_multi_az: ${{ vars.DATABASE_MULTI_AZ || 'false' }}
+      TF_VAR_database_deletion_protection: ${{ vars.DATABASE_DELETION_PROTECTION || 'false' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize shared and production state
+        run: |
+          terraform -chdir=terraform/shared init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${SHARED_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir=terraform/production init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${PRODUCTION_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Select the image to deploy
+        id: image
+        env:
+          BUILD_NEW_IMAGE: ${{ needs.changes.outputs.app == 'true' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$BUILD_NEW_IMAGE" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "tag=sha-${GITHUB_SHA}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          outputs="$(terraform -chdir=terraform/production output -json)"
+          cluster="$(printf '%s' "$outputs" | jq -r '.ecs_cluster_name.value // empty')"
+          service="$(printf '%s' "$outputs" | jq -r '.ecs_service_name.value // empty')"
+
+          if [ -z "$cluster" ] || [ -z "$service" ]; then
+            echo "::notice::No production ECS service exists yet; building the initial application image."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "tag=sha-${GITHUB_SHA}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          task_definition="$(aws ecs describe-services \
+            --cluster "$cluster" \
+            --services "$service" \
+            --query 'services[0].taskDefinition' \
+            --output text)"
+          if [ -z "$task_definition" ] || [ "$task_definition" = "None" ]; then
+            echo "::error::The production ECS service has no active task definition."
+            exit 1
+          fi
+
+          image="$(aws ecs describe-task-definition \
+            --task-definition "$task_definition" \
+            --query 'taskDefinition.containerDefinitions[0].image' \
+            --output text)"
+          if [ -z "$image" ] || [ "$image" = "None" ] || [[ "$image" != *:* ]]; then
+            echo "::error::Could not determine the deployed application image tag."
+            exit 1
+          fi
+
+          echo "build=false" >> "$GITHUB_OUTPUT"
+          echo "tag=${image##*:}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Amazon ECR
+        if: steps.image.outputs.build == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push immutable image
+        if: steps.image.outputs.build == 'true'
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          repository_uri="$(terraform -chdir=terraform/shared output -raw ecr_repository_url)"
+          docker build --platform linux/amd64 --tag "${repository_uri}:${IMAGE_TAG}" .
+          docker push "${repository_uri}:${IMAGE_TAG}"
+
+      - name: Create and render production plan
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          terraform -chdir=terraform/production plan \
+            -input=false \
+            -var="image_tag=${IMAGE_TAG}" \
+            -out=production.tfplan
+          terraform -chdir=terraform/production show -no-color production.tfplan > production-plan.txt
+
+      - name: Upload production plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-plan-${{ github.run_id }}
+          path: |
+            terraform/production/production.tfplan
+            production-plan.txt
+          retention-days: 1
+
+      - name: Summarize approval gate
+        run: |
+          {
+            echo "## Production plan is ready"
+            echo
+            echo "Review the readable \`production-plan.txt\` artifact before approving."
+            echo "The apply job uses the exact saved \`production.tfplan\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  production-apply:
+    name: Apply approved production plan
+    needs: [changes, production-plan]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      needs.production-plan.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize production state
+        run: |
+          terraform -chdir=terraform/production init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${PRODUCTION_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Download production plan
+        uses: actions/download-artifact@v4
+        with:
+          name: production-plan-${{ github.run_id }}
+          path: .
+
+      - name: Apply exact approved production plan
+        run: terraform -chdir=terraform/production apply -input=false -auto-approve production.tfplan
+
+      - name: Wait for ECS service stability
+        run: |
+          cluster="$(terraform -chdir=terraform/production output -raw ecs_cluster_name)"
+          service="$(terraform -chdir=terraform/production output -raw ecs_service_name)"
+          aws ecs wait services-stable --cluster "$cluster" --services "$service"
+
+      - name: Publish frontend and invalidate CloudFront
+        if: >-
+          needs.changes.outputs.frontend == 'true' ||
+          needs.changes.outputs.shared == 'true' ||
+          needs.changes.outputs.production == 'true' ||
+          github.event_name == 'workflow_dispatch'
+        run: |
+          outputs="$(terraform -chdir=terraform/production output -json)"
+          bucket="$(printf '%s' "$outputs" | jq -r '.frontend_bucket_name.value // empty')"
+          distribution_id="$(printf '%s' "$outputs" | jq -r '.cloudfront_distribution_id.value // empty')"
+
+          if [ -z "$bucket" ] || [ -z "$distribution_id" ]; then
+            echo "::warning::CloudFront is not enabled; skipping static frontend publish."
+            exit 0
+          fi
+
+          aws s3 sync frontend/ "s3://${bucket}" \
+            --delete \
+            --cache-control "public,max-age=300"
+          aws s3 cp frontend/index.html "s3://${bucket}/index.html" \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --content-type "text/html; charset=utf-8"
+          aws cloudfront create-invalidation \
+            --distribution-id "$distribution_id" \
+            --paths "/*"
+
+      - name: Print application URL
+        run: terraform -chdir=terraform/production output application_url
+
+  frontend-only:
+    name: Publish frontend without infrastructure changes
+    needs: [changes, quality-gate, production-apply]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.quality-gate.result == 'success' &&
+      (needs.changes.outputs.frontend == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.changes.outputs.shared != 'true' &&
+      needs.changes.outputs.production != 'true' &&
+      needs.changes.outputs.app != 'true' &&
+      github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize production state
+        run: |
+          terraform -chdir=terraform/production init \
+            -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${PRODUCTION_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Read frontend resources
+        id: resources
+        run: |
+          outputs="$(terraform -chdir=terraform/production output -json)"
+          bucket="$(printf '%s' "$outputs" | jq -r '.frontend_bucket_name.value // empty')"
+          distribution_id="$(printf '%s' "$outputs" | jq -r '.cloudfront_distribution_id.value // empty')"
+
+          if [ -z "$bucket" ] || [ -z "$distribution_id" ]; then
+            echo "::error::Frontend publish requires an applied production root with CloudFront enabled."
+            exit 1
+          fi
+
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "distribution_id=$distribution_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload static frontend
+        env:
+          FRONTEND_BUCKET: ${{ steps.resources.outputs.bucket }}
+        run: |
+          aws s3 sync frontend/ "s3://${FRONTEND_BUCKET}" \
+            --delete \
+            --cache-control "public,max-age=300"
+          aws s3 cp frontend/index.html "s3://${FRONTEND_BUCKET}/index.html" \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --content-type "text/html; charset=utf-8"
+
+      - name: Invalidate CloudFront cache
+        env:
+          DISTRIBUTION_ID: ${{ steps.resources.outputs.distribution_id }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
